@@ -58,6 +58,32 @@ local function getId(text)
     return (text or ""):match("%d%d%d%d%d+")
 end
 
+-- Loop state (FE-safe: when the song ends we just ask the server to play it again)
+local loopOn, loopId, lastFire, started, fails = true, nil, 0, false, 0
+
+local function getPlaySongRemote()
+    local rs = game:GetService("ReplicatedStorage")
+    local remotes = rs:FindFirstChild("Remotes")
+    local inv = remotes and remotes:FindFirstChild("Inventory")
+    local ps = inv and inv:FindFirstChild("PlaySong")
+    if ps and ps:IsA("RemoteEvent") then return ps end
+end
+
+local function getRadioSound()
+    local char = workspace:FindFirstChild(LocalPlayer.Name)
+    local radio = char and char:FindFirstChild("Radio")
+    local snd = radio and radio:FindFirstChild("Sound")
+    if snd and snd:IsA("Sound") then return snd, radio end
+end
+
+local function sendSong(id)
+    local ps = getPlaySongRemote()
+    if not ps then return false end
+    lastFire = os.clock()
+    ps:FireServer("https://www.roblox.com/asset/?id=" .. id)
+    return true
+end
+
 -- Boombox Tool (backpack / hand) --------------------------------
 local function findBoombox()
     local char = LocalPlayer.Character
@@ -173,18 +199,12 @@ end
 -- The game's own Radio UI fires ReplicatedStorage.Remotes.Inventory.PlaySong
 -- with the full asset URL; the sound then plays from Workspace.<you>.Radio.Sound
 local function playMM2(id)
-    local rs = game:GetService("ReplicatedStorage")
-    local remotes = rs:FindFirstChild("Remotes")
-    local inv = remotes and remotes:FindFirstChild("Inventory")
-    local ps = inv and inv:FindFirstChild("PlaySong")
-    if not (ps and ps:IsA("RemoteEvent")) then return nil end
-
-    local char = workspace:FindFirstChild(LocalPlayer.Name)
-    local hasRadio = char and char:FindFirstChild("Radio")
-
-    ps:FireServer("https://www.roblox.com/asset/?id=" .. id)
-    if hasRadio then
-        return "Sent to your radio"
+    if not getPlaySongRemote() then return nil end
+    local _, radio = getRadioSound()
+    loopId, started, fails = id, false, 0
+    sendSong(id)
+    if radio then
+        return loopOn and "Sent to radio (loop on)" or "Sent to your radio"
     end
     return "Sent, but no radio equipped? Equip one in Inventory > Radios"
 end
@@ -206,17 +226,13 @@ end
 -- Stop: asks the server radio to clear its song (same remote the game's UI uses),
 -- so it stops for everyone. Then checks whether the sound really stopped.
 local function stopMusic()
-    local rs = game:GetService("ReplicatedStorage")
-    local remotes = rs:FindFirstChild("Remotes")
-    local inv = remotes and remotes:FindFirstChild("Inventory")
-    local ps = inv and inv:FindFirstChild("PlaySong")
-    if not (ps and ps:IsA("RemoteEvent")) then
+    loopId = nil -- cancel looping so it doesn't restart
+    local ps = getPlaySongRemote()
+    if not ps then
         return "Stop remote not found"
     end
 
-    local char = workspace:FindFirstChild(LocalPlayer.Name)
-    local radio = char and char:FindFirstChild("Radio")
-    local snd = radio and radio:FindFirstChild("Sound")
+    local snd = getRadioSound()
 
     ps:FireServer("")
     task.wait(0.7)
@@ -297,6 +313,7 @@ local backBtn = button(bar, "<", Color3.fromRGB(90, 90, 100), UDim2.new(0, 24, 0
 backBtn.Visible = false
 local plusBtn = button(bar, "+", Color3.fromRGB(60, 150, 90), UDim2.new(0, 24, 0, 20), UDim2.new(1, -58, 0, 4), 15)
 local closeBtn = button(bar, "X", Color3.fromRGB(200, 60, 60), UDim2.new(0, 24, 0, 20), UDim2.new(1, -29, 0, 4), 12)
+local loopBtn = button(bar, "Loop", Color3.fromRGB(60, 150, 90), UDim2.new(0, 34, 0, 20), UDim2.new(1, -136, 0, 4), 10)
 local stopBtn = button(bar, "Stop", Color3.fromRGB(210, 110, 40), UDim2.new(0, 36, 0, 20), UDim2.new(1, -98, 0, 4), 10)
 
 -- Drag (mouse + touch)
@@ -409,6 +426,7 @@ local function showList()
     backBtn.Visible = false
     plusBtn.Visible = true
     stopBtn.Visible = true
+    loopBtn.Visible = true
     barTitle.Text = "Notes"
     barTitle.Position = UDim2.new(0, 8, 0, 0)
 end
@@ -430,6 +448,7 @@ local function showEditor(index)
     backBtn.Visible = true
     plusBtn.Visible = false
     stopBtn.Visible = false
+    loopBtn.Visible = false
     barTitle.Position = UDim2.new(0, 34, 0, 0)
 end
 
@@ -508,6 +527,43 @@ plusBtn.MouseButton1Click:Connect(function() showEditor(nil) end)
 
 stopBtn.MouseButton1Click:Connect(function()
     toast(stopMusic())
+end)
+
+local function refreshLoopBtn()
+    loopBtn.BackgroundColor3 = loopOn and Color3.fromRGB(60, 150, 90) or Color3.fromRGB(90, 90, 100)
+    loopBtn.Text = loopOn and "Loop" or "Loop off"
+    loopBtn.TextSize = loopOn and 10 or 8
+end
+loopBtn.MouseButton1Click:Connect(function()
+    loopOn = not loopOn
+    refreshLoopBtn()
+    toast(loopOn and "Loop on" or "Loop off")
+end)
+refreshLoopBtn()
+
+-- Loop watcher: when our song finishes, ask the server to play it again.
+-- Gives up after 3 tries that never start playing (e.g. intermission lock).
+task.spawn(function()
+    while gui.Parent do
+        task.wait(1)
+        if loopOn and loopId then
+            local snd = getRadioSound()
+            if snd and snd.SoundId:find(loopId, 1, true) then
+                if snd.Playing then
+                    started, fails = true, 0
+                elseif snd.TimeLength > 0 and os.clock() - lastFire > 3 then
+                    if not started then fails += 1 end
+                    if fails >= 3 then
+                        loopId = nil
+                        toast("Loop stopped: radio isn't playing", 3)
+                    else
+                        started = false
+                        sendSong(loopId)
+                    end
+                end
+            end
+        end
+    end
 end)
 backBtn.MouseButton1Click:Connect(showList)
 
