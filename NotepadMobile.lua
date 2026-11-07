@@ -1,6 +1,6 @@
 -- Saved Notepad (mobile friendly) + Boombox Play
 -- Saves to workspace folder: NotepadSaves.json (persists after re-executing)
--- Boombox: tap Learn once, play a song by hand, then ▶ works with any ID
+-- Boombox: MM2 radio supported directly (Remotes.Inventory.PlaySong). Top bar has a Stop button.
 
 local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
@@ -50,139 +50,15 @@ load()
 ----------------------------------------------------------------
 -- Boombox
 -- Play tries, in order:
---   1) the remote you "Learn"ed (works with MM2's inventory boombox)
+--   1) MM2's radio remote (Remotes.Inventory.PlaySong)
 --   2) a boombox Tool in your backpack/hand
 --   3) the boombox UI (types the ID into its box and presses its Play button)
 ----------------------------------------------------------------
-local LEARN_FILE = "NotepadBoomboxRemote.json"
-local learned = nil
-pcall(function()
-    if isfile and isfile(LEARN_FILE) then
-        learned = HttpService:JSONDecode(readfile(LEARN_FILE))
-    end
-end)
-
 local function getId(text)
     return (text or ""):match("%d%d%d%d%d+")
 end
 
-local function pathOf(inst)
-    local p, cur = {}, inst
-    while cur and cur ~= game do
-        table.insert(p, 1, cur.Name)
-        cur = cur.Parent
-    end
-    return p
-end
-
-local function resolvePath(path)
-    local obj = game
-    for _, name in ipairs(path) do
-        obj = obj and obj:FindFirstChild(name)
-    end
-    return obj
-end
-
--- 1) Learned remote ------------------------------------------------
-local function playLearned(id)
-    if not learned then return nil end
-    local remote = resolvePath(learned.path)
-    if not remote then return nil end
-    local args = {}
-    for i = 1, learned.n do
-        if i == learned.idIndex then
-            if learned.idKind == "number" then
-                args[i] = tonumber(id)
-            else
-                args[i] = learned.prefix .. id .. learned.suffix
-            end
-        else
-            args[i] = learned.args[i]
-        end
-    end
-    if learned.method == "InvokeServer" then
-        task.spawn(function() pcall(function() remote:InvokeServer(table.unpack(args, 1, learned.n)) end) end)
-    else
-        pcall(function() remote:FireServer(table.unpack(args, 1, learned.n)) end)
-    end
-    return "Sent (learned remote)"
-end
-
--- Learn mode: captures the next boombox remote call you make by hand
-local learning, hooked, learnCb, learnStamp = false, false, nil, 0
-
-local function capture(remote, method, n, args)
-    local idIndex, kind, prefix, suffix
-    local clean = {}
-    for i = 1, n do
-        local v = args[i]
-        local tv = type(v)
-        if not idIndex and tv == "number" and v % 1 == 0 and v >= 10000 then
-            idIndex, kind, clean[i] = i, "number", 0
-        elseif not idIndex and tv == "string" and v:find("%d%d%d%d%d+") then
-            local s, e = v:find("%d%d%d%d%d+")
-            idIndex, kind = i, "string"
-            prefix, suffix = v:sub(1, s - 1), v:sub(e + 1)
-            clean[i] = ""
-        elseif tv == "string" or tv == "number" or tv == "boolean" then
-            clean[i] = v
-        else
-            return -- has an argument type we can't store (table/instance)
-        end
-    end
-    if not idIndex then return end
-
-    learned = {
-        path = pathOf(remote), method = method, n = n, args = clean,
-        idIndex = idIndex, idKind = kind, prefix = prefix or "", suffix = suffix or "",
-    }
-    pcall(function()
-        if writefile then writefile(LEARN_FILE, HttpService:JSONEncode(learned)) end
-    end)
-    learning = false
-    if learnCb then task.defer(learnCb, remote.Name) end
-end
-
-local function installHook()
-    if hooked then return true end
-    if not (hookmetamethod and getnamecallmethod) then return false end
-    local old
-    old = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
-        if learning then
-            local method = getnamecallmethod()
-            if (method == "FireServer" or method == "InvokeServer")
-                and not (checkcaller and checkcaller()) then
-                local n = select("#", ...)
-                local args = { ... }
-                pcall(function()
-                    if typeof(self) == "Instance"
-                        and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-                        capture(self, method, n, args)
-                    end
-                end)
-            end
-        end
-        return old(self, ...)
-    end))
-    hooked = true
-    return true
-end
-
-local function startLearn(cb)
-    if not installHook() then return false end
-    learning, learnCb = true, cb
-    local my = os.clock()
-    learnStamp = my
-    task.delay(45, function()
-        if learning and learnStamp == my then
-            learning = false
-            cb(nil)
-        end
-    end)
-    return true
-end
-
--- 2) Boombox Tool (backpack / hand) --------------------------------
+-- Boombox Tool (backpack / hand) --------------------------------
 local function findBoombox()
     local char = LocalPlayer.Character
     local pack = LocalPlayer:FindFirstChildOfClass("Backpack")
@@ -223,7 +99,7 @@ local function playViaTool(id)
     return "Sent to boombox tool"
 end
 
--- 3) Boombox UI (type the ID + press its Play button) ---------------
+-- Boombox UI (type the ID + press its Play button) ---------------
 local function isShown(inst)
     local cur = inst
     while cur and not cur:IsA("PlayerGui") do
@@ -293,8 +169,28 @@ local function playViaGui(id)
     return nil
 end
 
+-- 0) MM2 radio: found by the diagnostic.
+-- The game's own Radio UI fires ReplicatedStorage.Remotes.Inventory.PlaySong
+-- with the full asset URL; the sound then plays from Workspace.<you>.Radio.Sound
+local function playMM2(id)
+    local rs = game:GetService("ReplicatedStorage")
+    local remotes = rs:FindFirstChild("Remotes")
+    local inv = remotes and remotes:FindFirstChild("Inventory")
+    local ps = inv and inv:FindFirstChild("PlaySong")
+    if not (ps and ps:IsA("RemoteEvent")) then return nil end
+
+    local char = workspace:FindFirstChild(LocalPlayer.Name)
+    local hasRadio = char and char:FindFirstChild("Radio")
+
+    ps:FireServer("https://www.roblox.com/asset/?id=" .. id)
+    if hasRadio then
+        return "Sent to your radio"
+    end
+    return "Sent, but no radio equipped? Equip one in Inventory > Radios"
+end
+
 local function playId(id)
-    local msg = playLearned(id) or playViaTool(id) or playViaGui(id)
+    local msg = playMM2(id) or playViaTool(id) or playViaGui(id)
     if msg then return msg end
     if LOCAL_FALLBACK then
         local s = Instance.new("Sound")
@@ -304,7 +200,31 @@ local function playId(id)
         s:Play()
         return "Playing locally"
     end
-    return "Not found: tap Learn, then play a song by hand"
+    return "No radio/boombox found. Equip one first"
+end
+
+-- Stop: asks the server radio to clear its song (same remote the game's UI uses),
+-- so it stops for everyone. Then checks whether the sound really stopped.
+local function stopMusic()
+    local rs = game:GetService("ReplicatedStorage")
+    local remotes = rs:FindFirstChild("Remotes")
+    local inv = remotes and remotes:FindFirstChild("Inventory")
+    local ps = inv and inv:FindFirstChild("PlaySong")
+    if not (ps and ps:IsA("RemoteEvent")) then
+        return "Stop remote not found"
+    end
+
+    local char = workspace:FindFirstChild(LocalPlayer.Name)
+    local radio = char and char:FindFirstChild("Radio")
+    local snd = radio and radio:FindFirstChild("Sound")
+
+    ps:FireServer("")
+    task.wait(0.7)
+
+    if snd and snd:IsA("Sound") and snd.Playing then
+        return "Stop sent, but it's still playing"
+    end
+    return "Stopped"
 end
 
 ----------------------------------------------------------------
@@ -377,7 +297,7 @@ local backBtn = button(bar, "<", Color3.fromRGB(90, 90, 100), UDim2.new(0, 24, 0
 backBtn.Visible = false
 local plusBtn = button(bar, "+", Color3.fromRGB(60, 150, 90), UDim2.new(0, 24, 0, 20), UDim2.new(1, -58, 0, 4), 15)
 local closeBtn = button(bar, "X", Color3.fromRGB(200, 60, 60), UDim2.new(0, 24, 0, 20), UDim2.new(1, -29, 0, 4), 12)
-local learnBtn = button(bar, "Learn", Color3.fromRGB(120, 90, 190), UDim2.new(0, 40, 0, 20), UDim2.new(1, -102, 0, 4), 10)
+local stopBtn = button(bar, "Stop", Color3.fromRGB(210, 110, 40), UDim2.new(0, 36, 0, 20), UDim2.new(1, -98, 0, 4), 10)
 
 -- Drag (mouse + touch)
 do
@@ -488,7 +408,7 @@ local function showList()
     listView.Visible = true
     backBtn.Visible = false
     plusBtn.Visible = true
-    learnBtn.Visible = true
+    stopBtn.Visible = true
     barTitle.Text = "Notes"
     barTitle.Position = UDim2.new(0, 8, 0, 0)
 end
@@ -509,7 +429,7 @@ local function showEditor(index)
     editView.Visible = true
     backBtn.Visible = true
     plusBtn.Visible = false
-    learnBtn.Visible = false
+    stopBtn.Visible = false
     barTitle.Position = UDim2.new(0, 34, 0, 0)
 end
 
@@ -586,15 +506,8 @@ end
 
 plusBtn.MouseButton1Click:Connect(function() showEditor(nil) end)
 
-learnBtn.MouseButton1Click:Connect(function()
-    local ok = startLearn(function(name)
-        toast(name and ("Learned: " .. name .. " - Play should work now") or "Learn timed out, try again", 3)
-    end)
-    if ok then
-        toast("Equip your boombox and play any song by hand now (45s)", 5)
-    else
-        toast("Your executor can't hook remotes (no hookmetamethod)", 3)
-    end
+stopBtn.MouseButton1Click:Connect(function()
+    toast(stopMusic())
 end)
 backBtn.MouseButton1Click:Connect(showList)
 
